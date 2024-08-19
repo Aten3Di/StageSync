@@ -6,13 +6,9 @@ ssh into your Klipper device and execute the following commands:
 cd  ~
 git clone https://github.com/Aten3Di/StageSync.git
 ```
-- Compile and flash the firmware into the MCU or the CANbus toolhead board which the BDsensor connected.
+- run the installation script.
 ```
 ~/StageSync/klipper/install_stagesync.sh
-cd ~/klipper/
-make menuconfig
-./make_with_bdsensor.sh
-make flash
 ```
 - Add the following section to moonraker.conf if your printer runs Moonraker and then you can update StageSync with 1 click via the klipper web page or screen.
 ```
