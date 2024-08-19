@@ -1,5 +1,7 @@
-# Support to handle heater_generic as an extension of extruder
-# Specific function to optimize the management of the Aten V-ONE hotend and similar.
+# StageSync allows you to define a main heater and synchronize additional
+# heaters to it by adding a temperature multiplier to each one.
+#
+# Support for optimizing management of the Aten V-ONE hotend and similar.
 # more information at www.aten3d.com
 #
 # Copyright (C) 2024 Aten <info@aten3d.com>
@@ -7,59 +9,96 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
-# If you need to manage multiple heaters and multiple temperature sensors in a single
-# hotend you can now do it cleanly. StageSync allows you to define the first heater
-# with attached temperature sensor in the [extruder] section and the additional heaters
-# and temperature sensors in the [heater_generic] section, also adding the "temp_ratio"
-# variable which is a temperature multiplier definable for each additional heater.
-#
 # klippy/extras/stagesync.py
 
 import logging
 
 class StageSync:
-    def __init__(self, config, extruder_name):
+    def __init__(self, config):
         self.printer = config.get_printer()
-        self.extruder_name = config.get_name().split()[1]
-        logging.info(f"Found extruder: {self.extruder_name}")
-        
+        self.heater_name = config.get_name().split()[1]
+        self.heater = None
+        self.stages = []  # Used to maintain the association between stages and temp_ratio
+        self.last_target_temp = None  # Stores the last target temperature for comparison
+        self.printer.register_event_handler("klippy:connect",
+                                            self.handle_connect)
+
+        logging.info(f"StageSync initialized for heater: {self.heater_name}")
+
         stage_names = config.get('stages').split(',')
         temp_ratios = config.get('temp_ratio').split(',')
 
-        # Lookup and map each heater with its corresponding temp_ratio
-        self.heaters = []
+        # Save the names and temp_ratios for future mapping
         for stage_name, temp_ratio in zip(stage_names, temp_ratios):
-            stage_name = stage_name.strip()
             try:
-                heater = self.printer.lookup_object(f"heater_generic {stage_name}")
-                temp_ratio = float(temp_ratio.strip())
-                self.heaters.append((heater, temp_ratio))
-                logging.info(f"Mapped heater: {stage_name} with temp_ratio: {temp_ratio}")
+                stage = self.printer.lookup_object(stage_name.strip())
+                if not stage:
+                    raise Exception(f"Stage {stage_name} not found")
+                
+                self.stages.append((stage, float(temp_ratio.strip())))
+                logging.info(f"Mapped stage: {stage_name.strip()} with temp_ratio: {temp_ratio.strip()}")
             except Exception as e:
-                logging.error(f"Error mapping heater {stage_name}: {e}")
+                logging.error(f"Error mapping stage {stage_name.strip()}: {e}")
 
-        # Register an event handler for temperature synchronization
-        self.printer.register_event_handler("klippy:connect", self._connect)
-        logging.info(f"StageSync for {self.extruder_name} initialized successfully.")
+        # Register the handler for synchronization when the system is ready
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
-    def _connect(self):
-        # Synchronize temperatures when the printer connects
-        logging.info(f"Synchronizing temperatures for extruder: {self.extruder_name}")
-        self.sync_temperatures()
+    def handle_connect(self):
+        try:
+            pheaters = self.printer.lookup_object('heaters')
+            self.heater = pheaters.lookup_heater(self.heater_name)
+            logging.info("Heater %s initialized successfully", self.heater_name)
+            reactor = self.printer.get_reactor()
+            self.check_timer = reactor.register_timer(self.check_event, reactor.NOW)
+        except Exception as e:
+            logging.error(f"Error initializing heater {self.heater_name}: {e}")
 
-    def sync_temperatures(self):
-        # Apply the target temperature of the extruder to its associated heaters
-        target_temp = self.extruder.get_status()['target']
-        logging.info(f"Extruder target temperature: {target_temp}")
-        for heater, temp_ratio in self.heaters:
-            adjusted_temp = target_temp * temp_ratio
-            heater.set_temp(adjusted_temp)
-            logging.info(f"Set heater to: {adjusted_temp} based on temp_ratio: {temp_ratio}")
+    def handle_ready(self):
+        try:
+            # Synchronize temperatures on the first run
+            self.sync_temperatures(self.last_target_temp)
+        except Exception as e:
+            logging.error(f"Error during temperature synchronization for heater {self.heater_name}: {e}")
+
+    def check_event(self, eventtime):
+        try:
+            temp, target = self.heater.get_temp(eventtime)
+            if temp >= target or target is None or target <= 0.:
+                logging.error(f"Failed to get target temperature for {self.heater_name}.")
+                return
+
+            logging.info(f"Heater target temperature: {target}")
+
+            if target != self.last_target_temp:
+                self.last_target_temp = target
+                self.sync_temperatures(target)
+        except Exception as e:
+            logging.error(f"Error in temperature callback for {self.heater_name}: {e}")
+
+    def sync_temperatures(self, target):
+        logging.info("Syncing temperatures...")
+        if not self.heater:
+            logging.error(f"Heater {self.heater_name} is not available.")
+            return
+
+        logging.info(f"Heater target temperature: {target}")
+
+        # Apply the temperature to the stages using a G-code command
+        for stage, temp_ratio in self.stages:
+            adjusted_temp = target * temp_ratio
+            stage_name = stage.get_name()  # Assuming the get_name() method exists and returns the stage name
+            gcode_command = f'SET_HEATER_TEMPERATURE HEATER="{stage_name}" TARGET="{adjusted_temp}"'
+            logging.info(f"Sending G-code command: {gcode_command}")
+            try:
+                self.printer.run_script(gcode_command)
+                logging.info(f"G-code command sent successfully: {gcode_command}")
+            except Exception as e:
+                logging.error(f"Failed to send G-code command for stage {stage_name}: {e}")
 
 def load_config_prefix(config):
-    # Extract the extruder name from the section prefix
-    prefix_name = config.get_name()
-    extruder_name = prefix_name.split(' ', 1)[1]  # Gets the part after "stagesync "
+    logging.info(f"Loading config for stagesync: {config.get_name()}")
+    return StageSync(config)
+
 
     logging.info(f"Loading config for stagesync: {prefix_name}")
     return StageSync(config, extruder_name)
