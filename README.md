@@ -27,29 +27,3 @@ Support for additional heaters synchronized to an extruder's temperatures (any n
 #   and if not defined a multiplier of 1.0 will be applied.
 
 ```
-
-### example of printer.cfg
-```
-[extruder]
-…
-
-[extruder1]
-…
-
-[stagesync extruder]
-stages: stage1, stage2
-temp_ratio: 1.0, 0.9
-
-[stagesync extruder1]
-stages: stage3
-temp_ratio: 1.4
-
-[heater_generic stage1]
-…
-
-[heater_generic stage2]
-…
-
-[heater_generic stage3]
-…
-```
