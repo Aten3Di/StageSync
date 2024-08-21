@@ -20,10 +20,8 @@ class StageSync:
         self.heater = None
         self.stages = []  # Used to maintain the association between stages and temp_ratio
         self.last_target_temp = None  # Stores the last target temperature for comparison
-        self.printer.register_event_handler("klippy:connect",
-                                            self.handle_connect)
-
-        logging.info(f"StageSync initialized for heater: {self.heater_name}")
+        self.gcode = self.printer.lookup_object('gcode')  # Lookup the gcode object
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         stage_names = config.get('stages').split(',')
         temp_ratios = config.get('temp_ratio').split(',')
@@ -31,14 +29,21 @@ class StageSync:
         # Save the names and temp_ratios for future mapping
         for stage_name, temp_ratio in zip(stage_names, temp_ratios):
             try:
-                stage = self.printer.lookup_object(stage_name.strip())
-                if not stage:
-                    raise Exception(f"Stage {stage_name} not found")
+                temp_ratio_value = float(temp_ratio.strip())
                 
-                self.stages.append((stage, float(temp_ratio.strip())))
-                logging.info(f"Mapped stage: {stage_name.strip()} with temp_ratio: {temp_ratio.strip()}")
+                # Validate temp_ratio
+                if temp_ratio_value < 0 or temp_ratio_value > 2.0:
+                    self.ratio_fault(stage_name.strip(), temp_ratio_value)
+
+                # Attempt to look up the heater object by name using general object lookup
+                stage = self.printer.lookup_object('heater', stage_name.strip())
+                if stage is None:
+                    self.stages_fault(stage_name.strip())
+                
+                self.stages.append((stage, temp_ratio_value))
+                logging.info(f"StageSync stages: {stage_name.strip()} with temp_ratio: {temp_ratio.strip()}")
             except Exception as e:
-                logging.error(f"Error mapping stage {stage_name.strip()}: {e}")
+                self.mapping_fault(stage_name.strip(), e)
 
         # Register the handler for synchronization when the system is ready
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -47,58 +52,75 @@ class StageSync:
         try:
             pheaters = self.printer.lookup_object('heaters')
             self.heater = pheaters.lookup_heater(self.heater_name)
-            logging.info("Heater %s initialized successfully", self.heater_name)
             reactor = self.printer.get_reactor()
             self.check_timer = reactor.register_timer(self.check_event, reactor.NOW)
         except Exception as e:
-            logging.error(f"Error initializing heater {self.heater_name}: {e}")
+            self.heater_fault(self.heater_name, e)
 
     def handle_ready(self):
         try:
             # Synchronize temperatures on the first run
             self.sync_temperatures(self.last_target_temp)
         except Exception as e:
-            logging.error(f"Error during temperature synchronization for heater {self.heater_name}: {e}")
+            pass  # Removed logging of temperature synchronization error
 
     def check_event(self, eventtime):
         try:
             temp, target = self.heater.get_temp(eventtime)
-            if temp >= target or target is None or target <= 0.:
-                logging.error(f"Failed to get target temperature for {self.heater_name}.")
-                return
-
-            logging.info(f"Heater target temperature: {target}")
+            if target is None or target <= 0.:
+                return eventtime + 1.0  # Retry after 1 second
 
             if target != self.last_target_temp:
                 self.last_target_temp = target
                 self.sync_temperatures(target)
+
+            # Schedule the next check in 1 second
+            next_check_time = eventtime + 1.0
+            return next_check_time
+
         except Exception as e:
-            logging.error(f"Error in temperature callback for {self.heater_name}: {e}")
+            return eventtime + 1.0  # Retry after 1 second
 
     def sync_temperatures(self, target):
-        logging.info("Syncing temperatures...")
         if not self.heater:
-            logging.error(f"Heater {self.heater_name} is not available.")
             return
 
-        logging.info(f"Heater target temperature: {target}")
+        if target is None:
+            return
 
         # Apply the temperature to the stages using a G-code command
         for stage, temp_ratio in self.stages:
             adjusted_temp = target * temp_ratio
-            stage_name = stage.get_name()  # Assuming the get_name() method exists and returns the stage name
+            stage_name = stage.get_name() if hasattr(stage, 'get_name') else stage
             gcode_command = f'SET_HEATER_TEMPERATURE HEATER="{stage_name}" TARGET="{adjusted_temp}"'
-            logging.info(f"Sending G-code command: {gcode_command}")
             try:
-                self.printer.run_script(gcode_command)
-                logging.info(f"G-code command sent successfully: {gcode_command}")
+                self.gcode.run_script(gcode_command)  # Use gcode object to send the command
             except Exception as e:
-                logging.error(f"Failed to send G-code command for stage {stage_name}: {e}")
+                logging.error(f"Temperature synchronization via G-code failed! {stage_name}: {e}")
+
+    def ratio_fault(self, stage_name, temp_ratio_value):
+        msg = f"StageSync: temp_ratio for stage '{stage_name}' is out of bounds: {temp_ratio_value}"
+        logging.error(msg)
+        self.printer.invoke_shutdown(msg)
+        return self.printer.get_reactor().NEVER
+
+    def stages_fault(self, stage_name):
+        msg = f"StageSync: stage '{stage_name}' not found"
+        logging.error(msg)
+        self.printer.invoke_shutdown(msg)
+        return self.printer.get_reactor().NEVER
+
+    def heater_fault(self, heater_name, error):
+        msg = f"StageSync: Error initializing heater '{heater_name}': {error}"
+        logging.error(msg)
+        self.printer.invoke_shutdown(msg)
+        return self.printer.get_reactor().NEVER
+
+    def mapping_fault(self, stage_name, error):
+        msg = f"StageSync: Error mapping stage '{stage_name}': {error}"
+        logging.error(msg)
+        self.printer.invoke_shutdown(msg)
+        return self.printer.get_reactor().NEVER
 
 def load_config_prefix(config):
-    logging.info(f"Loading config for stagesync: {config.get_name()}")
     return StageSync(config)
-
-
-    logging.info(f"Loading config for stagesync: {prefix_name}")
-    return StageSync(config, extruder_name)
